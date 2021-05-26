@@ -101,7 +101,7 @@ package object config {
   private[spark] val EXECUTOR_BIND_ADDRESS = ConfigBuilder("spark.executor.bindAddress")
     .doc("Address where to bind network listen sockets on the executor.")
     .stringConf
-    .createWithDefault(Utils.localHostName())
+    .createOptional
 
   private[spark] val EXECUTOR_MEMORY_OVERHEAD = ConfigBuilder("spark.executor.memoryOverhead")
     .doc("The amount of off-heap memory to be allocated per executor in cluster mode, " +
