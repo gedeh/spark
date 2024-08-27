@@ -875,7 +875,7 @@ class YarnAllocatorSuite extends SparkFunSuite
     handler.updateResourceRequests()
 
     val container = createContainer("host1")
-    handler.handleAllocatedContainers(Array(container).toImmutableArraySeq)
+    handler.handleAllocatedContainers(Array(container))
 
     handler.allocatedContainerToHostMap.get(container.getId).get should be ("host1")
     handler.allocatedContainerToBindAddressMap.get(container.getId).get should be ("0.0.0.0")
