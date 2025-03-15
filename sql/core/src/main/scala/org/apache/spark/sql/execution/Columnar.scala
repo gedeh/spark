@@ -194,7 +194,7 @@ case class ColumnarToRowExec(child: SparkPlan) extends ColumnarToRowTransition w
        |    $shouldStop
        |  }
        |  $idx = $numRows;
-       |  $batch.closeIfNotWritable();
+       |  $batch.closeIfFreeable();
        |  $batch = null;
        |  $nextBatchFuncName();
        |}
@@ -533,6 +533,10 @@ case class ApplyColumnarRulesAndInsertTransitions(
         case write: DataWritingCommandExec
             if write.cmd.isInstanceOf[V1WriteCommand] && conf.plannedWriteEnabled =>
           write.child.supportsColumnar
+        // If it is not required to output columnar (`outputsColumnar` is false), and the plan
+        // supports row-based and columnar, we don't need to output row-based data on its children
+        // nodes. So we set `outputsColumnar` to true.
+        case _ if plan.supportsColumnar && plan.supportsRowBased => true
         case _ =>
           false
       }

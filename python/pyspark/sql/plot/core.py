@@ -19,11 +19,10 @@ import math
 
 from typing import Any, TYPE_CHECKING, List, Optional, Union, Sequence
 from types import ModuleType
-from pyspark.errors import PySparkTypeError, PySparkValueError
+from pyspark.errors import PySparkValueError
 from pyspark.sql import Column, functions as F
 from pyspark.sql.internal import InternalFunction as SF
 from pyspark.sql.pandas.utils import require_minimum_pandas_version
-from pyspark.sql.types import NumericType
 from pyspark.sql.utils import NumpyHelper, require_minimum_plotly_version
 
 if TYPE_CHECKING:
@@ -86,6 +85,13 @@ class PySparkSampledPlotBase:
 
 
 class PySparkPlotAccessor:
+    """
+    Accessor for DataFrame plotting functionality in PySpark.
+
+    Users can call the accessor as ``df.plot(kind="line")`` or use the dedicated
+    methods like ``df.plot.line(...)`` to generate plots.
+    """
+
     plot_data_map = {
         "area": PySparkSampledPlotBase().get_sampled,
         "bar": PySparkTopNPlotBase().get_top_n,
@@ -295,7 +301,7 @@ class PySparkPlotAccessor:
         """
         return self(kind="area", x=x, y=y, **kwargs)
 
-    def pie(self, x: str, y: str, **kwargs: Any) -> "Figure":
+    def pie(self, x: str, y: Optional[str], **kwargs: Any) -> "Figure":
         """
         Generate a pie plot.
 
@@ -306,8 +312,8 @@ class PySparkPlotAccessor:
         ----------
         x : str
             Name of column to be used as the category labels for the pie plot.
-        y : str
-            Name of the column to plot.
+        y : str, optional
+            Name of the column to plot. If not provided, `subplots=True` must be passed at `kwargs`.
         **kwargs
             Additional keyword arguments.
 
@@ -327,19 +333,8 @@ class PySparkPlotAccessor:
         >>> columns = ["sales", "signups", "visits", "date"]
         >>> df = spark.createDataFrame(data, columns)
         >>> df.plot.pie(x='date', y='sales')  # doctest: +SKIP
+        >>> df.plot.pie(x='date', subplots=True)  # doctest: +SKIP
         """
-        schema = self.data.schema
-
-        # Check if 'y' is a numerical column
-        y_field = schema[y] if y in schema.names else None
-        if y_field is None or not isinstance(y_field.dataType, NumericType):
-            raise PySparkTypeError(
-                errorClass="PLOT_NOT_NUMERIC_COLUMN_ARGUMENT",
-                messageParameters={
-                    "arg_name": "y",
-                    "arg_type": str(y_field.dataType.__class__.__name__) if y_field else "None",
-                },
-            )
         return self(kind="pie", x=x, y=y, **kwargs)
 
     def box(self, column: Optional[Union[str, List[str]]] = None, **kwargs: Any) -> "Figure":
@@ -427,9 +422,9 @@ class PySparkPlotAccessor:
         >>> data = [(5.1, 3.5, 0), (4.9, 3.0, 0), (7.0, 3.2, 1), (6.4, 3.2, 1), (5.9, 3.0, 2)]
         >>> columns = ["length", "width", "species"]
         >>> df = spark.createDataFrame(data, columns)
-        >>> df.plot.kde(bw_method=0.3)  # doctest: +SKIP
-        >>> df.plot.kde(column=["length", "width"], bw_method=0.3)  # doctest: +SKIP
-        >>> df.plot.kde(column="length", bw_method=0.3)  # doctest: +SKIP
+        >>> df.plot.kde(bw_method=0.3, ind=100)  # doctest: +SKIP
+        >>> df.plot.kde(column=["length", "width"], bw_method=0.3, ind=100)  # doctest: +SKIP
+        >>> df.plot.kde(column="length", bw_method=0.3, ind=100)  # doctest: +SKIP
         """
         return self(kind="kde", column=column, bw_method=bw_method, ind=ind, **kwargs)
 
@@ -709,29 +704,27 @@ class PySparkBoxPlotBase:
             lfence = q1 - F.lit(whis) * iqr
             ufence = q3 + F.lit(whis) * iqr
 
-            stats_scols.append(
-                F.struct(
-                    F.mean(colname).alias("mean"),
-                    med.alias("med"),
-                    q1.alias("q1"),
-                    q3.alias("q3"),
-                    lfence.alias("lfence"),
-                    ufence.alias("ufence"),
-                ).alias(f"_box_plot_stats_{i}")
-            )
+            stats_scols.append(F.mean(colname).alias(f"mean_{i}"))
+            stats_scols.append(med.alias(f"med_{i}"))
+            stats_scols.append(q1.alias(f"q1_{i}"))
+            stats_scols.append(q3.alias(f"q3_{i}"))
+            stats_scols.append(lfence.alias(f"lfence_{i}"))
+            stats_scols.append(ufence.alias(f"ufence_{i}"))
 
-        sdf_stats = sdf.select(*stats_scols)
+        # compute all stats with a scalar subquery
+        stats_col = "__pyspark_plotting_box_plot_stats__"
+        sdf = sdf.select("*", sdf.select(F.struct(*stats_scols)).scalar().alias(stats_col))
 
         result_scols = []
         for i, colname in enumerate(formatted_colnames):
             value = F.col(colname)
 
-            lfence = F.col(f"_box_plot_stats_{i}.lfence")
-            ufence = F.col(f"_box_plot_stats_{i}.ufence")
-            mean = F.col(f"_box_plot_stats_{i}.mean")
-            med = F.col(f"_box_plot_stats_{i}.med")
-            q1 = F.col(f"_box_plot_stats_{i}.q1")
-            q3 = F.col(f"_box_plot_stats_{i}.q3")
+            lfence = F.col(f"{stats_col}.lfence_{i}")
+            ufence = F.col(f"{stats_col}.ufence_{i}")
+            mean = F.col(f"{stats_col}.mean_{i}")
+            med = F.col(f"{stats_col}.med_{i}")
+            q1 = F.col(f"{stats_col}.q1_{i}")
+            q3 = F.col(f"{stats_col}.q3_{i}")
 
             outlier = ~value.between(lfence, ufence)
 
@@ -763,5 +756,4 @@ class PySparkBoxPlotBase:
                 ).alias(f"_box_plot_results_{i}")
             )
 
-        sdf_result = sdf.join(sdf_stats.hint("broadcast")).select(*result_scols)
-        return sdf_result.first()
+        return sdf.select(*result_scols).first()

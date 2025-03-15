@@ -249,12 +249,17 @@ class WrappedReadStateStore(store: StateStore) extends ReadStateStore {
  * @param memoryUsedBytes Memory used by the state store
  * @param customMetrics   Custom implementation-specific metrics
  *                        The metrics reported through this must have the same `name` as those
- *                        reported by `StateStoreProvider.customMetrics`.
+ *                        reported by `StateStoreProvider.supportedCustomMetrics`.
+ * @param instanceMetrics Custom implementation-specific metrics that are specific to state stores
+ *                        The metrics reported through this must have the same `name` as those
+ *                        reported by `StateStoreProvider.supportedInstanceMetrics`,
+ *                        including partition id and store name.
  */
 case class StateStoreMetrics(
     numKeys: Long,
     memoryUsedBytes: Long,
-    customMetrics: Map[StateStoreCustomMetric, Long])
+    customMetrics: Map[StateStoreCustomMetric, Long],
+    instanceMetrics: Map[StateStoreInstanceMetric, Long] = Map.empty)
 
 /**
  * State store checkpoint information, used to pass checkpointing information from executors
@@ -284,7 +289,8 @@ object StateStoreMetrics {
     StateStoreMetrics(
       allMetrics.map(_.numKeys).sum,
       allMetrics.map(_.memoryUsedBytes).sum,
-      combinedCustomMetrics)
+      combinedCustomMetrics,
+      allMetrics.flatMap(_.instanceMetrics).toMap)
   }
 }
 
@@ -321,9 +327,101 @@ case class StateStoreCustomTimingMetric(name: String, desc: String) extends Stat
     SQLMetrics.createTimingMetric(sparkContext, desc)
 }
 
+trait StateStoreInstanceMetric {
+  def metricPrefix: String
+  def descPrefix: String
+  def partitionId: Option[Int]
+  def storeName: String
+  def initValue: Long
+
+  def createSQLMetric(sparkContext: SparkContext): SQLMetric
+
+  /**
+   * Defines how instance metrics are selected for progress reporting.
+   * Metrics are sorted by value using this ordering, and only the first N metrics are displayed.
+   * For example, the highest N metrics by value should use Ordering.Long.reverse.
+   */
+  def ordering: Ordering[Long]
+
+  /** Should this instance metric be reported if it is unchanged from its initial value */
+  def ignoreIfUnchanged: Boolean
+
+  /**
+   * Defines how to merge metric values from different executors for the same state store
+   * instance in situations like speculative execution or provider unloading. In most cases,
+   * the original metric value is at its initial value.
+   */
+  def combine(originalMetric: SQLMetric, value: Long): Long
+
+  def name: String = {
+    assert(partitionId.isDefined, "Partition ID must be defined for instance metric name")
+    s"$metricPrefix.partition_${partitionId.get}_$storeName"
+  }
+
+  def desc: String = {
+    assert(partitionId.isDefined, "Partition ID must be defined for instance metric description")
+    s"$descPrefix (partitionId = ${partitionId.get}, storeName = $storeName)"
+  }
+
+  def withNewId(partitionId: Int, storeName: String): StateStoreInstanceMetric
+}
+
+case class StateStoreSnapshotLastUploadInstanceMetric(
+    partitionId: Option[Int] = None,
+    storeName: String = StateStoreId.DEFAULT_STORE_NAME)
+  extends StateStoreInstanceMetric {
+
+  override def metricPrefix: String = "SnapshotLastUploaded"
+
+  override def descPrefix: String = {
+    "The last uploaded version of the snapshot for a specific state store instance"
+  }
+
+  override def initValue: Long = -1L
+
+  override def createSQLMetric(sparkContext: SparkContext): SQLMetric = {
+    SQLMetrics.createSizeMetric(sparkContext, desc, initValue)
+  }
+
+  override def ordering: Ordering[Long] = Ordering.Long
+
+  override def ignoreIfUnchanged: Boolean = false
+
+  override def combine(originalMetric: SQLMetric, value: Long): Long = {
+    // Check for cases where the initial value is less than 0, forcing metric.value to
+    // convert it to 0. Since the last uploaded snapshot version can have an initial
+    // value of -1, we need special handling to avoid turning the -1 into a 0.
+    if (originalMetric.isZero) {
+      value
+    } else {
+      // Use max to grab the most recent snapshot version across all executors
+      // of the same store instance
+      Math.max(originalMetric.value, value)
+    }
+  }
+
+  override def withNewId(
+      partitionId: Int,
+      storeName: String): StateStoreSnapshotLastUploadInstanceMetric = {
+    copy(partitionId = Some(partitionId), storeName = storeName)
+  }
+}
+
 sealed trait KeyStateEncoderSpec {
+  def keySchema: StructType
   def jsonValue: JValue
   def json: String = compact(render(jsonValue))
+
+  /**
+   * Creates a RocksDBKeyStateEncoder for this specification.
+   *
+   * @param dataEncoder The encoder to handle the actual data encoding/decoding
+   * @param useColumnFamilies Whether to use RocksDB column families
+   * @return A RocksDBKeyStateEncoder configured for this spec
+   */
+  def toEncoder(
+      dataEncoder: RocksDBDataEncoder,
+      useColumnFamilies: Boolean): RocksDBKeyStateEncoder
 }
 
 object KeyStateEncoderSpec {
@@ -347,6 +445,13 @@ case class NoPrefixKeyStateEncoderSpec(keySchema: StructType) extends KeyStateEn
   override def jsonValue: JValue = {
     ("keyStateEncoderType" -> JString("NoPrefixKeyStateEncoderSpec"))
   }
+
+  override def toEncoder(
+      dataEncoder: RocksDBDataEncoder,
+      useColumnFamilies: Boolean): RocksDBKeyStateEncoder = {
+    new NoPrefixKeyStateEncoder(
+      dataEncoder, keySchema, useColumnFamilies)
+  }
 }
 
 case class PrefixKeyScanStateEncoderSpec(
@@ -354,6 +459,13 @@ case class PrefixKeyScanStateEncoderSpec(
     numColsPrefixKey: Int) extends KeyStateEncoderSpec {
   if (numColsPrefixKey == 0 || numColsPrefixKey >= keySchema.length) {
     throw StateStoreErrors.incorrectNumOrderingColsForPrefixScan(numColsPrefixKey.toString)
+  }
+
+  override def toEncoder(
+      dataEncoder: RocksDBDataEncoder,
+      useColumnFamilies: Boolean): RocksDBKeyStateEncoder = {
+    new PrefixKeyScanStateEncoder(
+      dataEncoder, keySchema, numColsPrefixKey, useColumnFamilies)
   }
 
   override def jsonValue: JValue = {
@@ -368,6 +480,13 @@ case class RangeKeyScanStateEncoderSpec(
     orderingOrdinals: Seq[Int]) extends KeyStateEncoderSpec {
   if (orderingOrdinals.isEmpty || orderingOrdinals.length > keySchema.length) {
     throw StateStoreErrors.incorrectNumOrderingColsForRangeScan(orderingOrdinals.length.toString)
+  }
+
+  override def toEncoder(
+      dataEncoder: RocksDBDataEncoder,
+      useColumnFamilies: Boolean): RocksDBKeyStateEncoder = {
+    new RangeKeyScanStateEncoder(
+      dataEncoder, keySchema, orderingOrdinals, useColumnFamilies)
   }
 
   override def jsonValue: JValue = {
@@ -426,7 +545,8 @@ trait StateStoreProvider {
       useColumnFamilies: Boolean,
       storeConfs: StateStoreConf,
       hadoopConf: Configuration,
-      useMultipleValuesPerKey: Boolean = false): Unit
+      useMultipleValuesPerKey: Boolean = false,
+      stateSchemaProvider: Option[StateSchemaProvider] = None): Unit
 
   /**
    * Return the id of the StateStores this provider will generate.
@@ -461,9 +581,16 @@ trait StateStoreProvider {
   /**
    * Optional custom metrics that the implementation may want to report.
    * @note The StateStore objects created by this provider must report the same custom metrics
-   * (specifically, same names) through `StateStore.metrics`.
+   * (specifically, same names) through `StateStore.metrics.customMetrics`.
    */
   def supportedCustomMetrics: Seq[StateStoreCustomMetric] = Nil
+
+  /**
+   * Optional custom state store instance metrics that the implementation may want to report.
+   * @note The StateStore objects created by this provider must report the same instance metrics
+   * (specifically, same names) through `StateStore.metrics.instanceMetrics`.
+   */
+  def supportedInstanceMetrics: Seq[StateStoreInstanceMetric] = Seq.empty
 }
 
 object StateStoreProvider {
@@ -493,10 +620,11 @@ object StateStoreProvider {
       useColumnFamilies: Boolean,
       storeConf: StateStoreConf,
       hadoopConf: Configuration,
-      useMultipleValuesPerKey: Boolean): StateStoreProvider = {
+      useMultipleValuesPerKey: Boolean,
+      stateSchemaProvider: Option[StateSchemaProvider]): StateStoreProvider = {
     val provider = create(storeConf.providerClass)
     provider.init(providerId.storeId, keySchema, valueSchema, keyStateEncoderSpec,
-      useColumnFamilies, storeConf, hadoopConf, useMultipleValuesPerKey)
+      useColumnFamilies, storeConf, hadoopConf, useMultipleValuesPerKey, stateSchemaProvider)
     provider
   }
 
@@ -710,7 +838,9 @@ object StateStore extends Logging {
    * Thread Pool that runs maintenance on partitions that are scheduled by
    * MaintenanceTask periodically
    */
-  class MaintenanceThreadPool(numThreads: Int) {
+  class MaintenanceThreadPool(
+      numThreads: Int,
+      shutdownTimeout: Long) {
     private val threadPool = ThreadUtils.newDaemonFixedThreadPool(
       numThreads, "state-store-maintenance-thread")
 
@@ -723,10 +853,11 @@ object StateStore extends Logging {
       threadPool.shutdown() // Disable new tasks from being submitted
 
       // Wait a while for existing tasks to terminate
-      if (!threadPool.awaitTermination(5 * 60, TimeUnit.SECONDS)) {
+      if (!threadPool.awaitTermination(shutdownTimeout, TimeUnit.SECONDS)) {
         logWarning(
-          s"MaintenanceThreadPool is not able to be terminated within 300 seconds," +
-            " forcefully shutting down now.")
+          log"MaintenanceThreadPool failed to terminate within " +
+          log"waitTimeout=${MDC(LogKeys.TIMEOUT, shutdownTimeout)} seconds, " +
+          log"forcefully shutting down now.")
         threadPool.shutdownNow() // Cancel currently executing tasks
 
         // Wait a while for tasks to respond to being cancelled
@@ -746,6 +877,7 @@ object StateStore extends Logging {
   @GuardedBy("loadedProviders")
   private var _coordRef: StateStoreCoordinatorRef = null
 
+  // scalastyle:off
   /** Get or create a read-only store associated with the id. */
   def getReadOnly(
       storeProviderId: StateStoreProviderId,
@@ -754,15 +886,18 @@ object StateStore extends Logging {
       keyStateEncoderSpec: KeyStateEncoderSpec,
       version: Long,
       stateStoreCkptId: Option[String],
+      stateSchemaBroadcast: Option[StateSchemaBroadcast],
       useColumnFamilies: Boolean,
       storeConf: StateStoreConf,
       hadoopConf: Configuration,
       useMultipleValuesPerKey: Boolean = false): ReadStateStore = {
+    hadoopConf.set(StreamExecution.RUN_ID_KEY, storeProviderId.queryRunId.toString)
     if (version < 0) {
       throw QueryExecutionErrors.unexpectedStateStoreVersion(version)
     }
     val storeProvider = getStateStoreProvider(storeProviderId, keySchema, valueSchema,
-      keyStateEncoderSpec, useColumnFamilies, storeConf, hadoopConf, useMultipleValuesPerKey)
+      keyStateEncoderSpec, useColumnFamilies, storeConf, hadoopConf, useMultipleValuesPerKey,
+      stateSchemaBroadcast)
     storeProvider.getReadStore(version, stateStoreCkptId)
   }
 
@@ -774,18 +909,22 @@ object StateStore extends Logging {
       keyStateEncoderSpec: KeyStateEncoderSpec,
       version: Long,
       stateStoreCkptId: Option[String],
+      stateSchemaBroadcast: Option[StateSchemaBroadcast],
       useColumnFamilies: Boolean,
       storeConf: StateStoreConf,
       hadoopConf: Configuration,
       useMultipleValuesPerKey: Boolean = false): StateStore = {
+    hadoopConf.set(StreamExecution.RUN_ID_KEY, storeProviderId.queryRunId.toString)
     if (version < 0) {
       throw QueryExecutionErrors.unexpectedStateStoreVersion(version)
     }
     hadoopConf.set(StreamExecution.RUN_ID_KEY, storeProviderId.queryRunId.toString)
     val storeProvider = getStateStoreProvider(storeProviderId, keySchema, valueSchema,
-      keyStateEncoderSpec, useColumnFamilies, storeConf, hadoopConf, useMultipleValuesPerKey)
+      keyStateEncoderSpec, useColumnFamilies, storeConf, hadoopConf, useMultipleValuesPerKey,
+      stateSchemaBroadcast)
     storeProvider.getStore(version, stateStoreCkptId)
   }
+  // scalastyle:on
 
   private def getStateStoreProvider(
       storeProviderId: StateStoreProviderId,
@@ -795,7 +934,8 @@ object StateStore extends Logging {
       useColumnFamilies: Boolean,
       storeConf: StateStoreConf,
       hadoopConf: Configuration,
-      useMultipleValuesPerKey: Boolean): StateStoreProvider = {
+      useMultipleValuesPerKey: Boolean,
+      stateSchemaBroadcast: Option[StateSchemaBroadcast]): StateStoreProvider = {
     loadedProviders.synchronized {
       startMaintenanceIfNeeded(storeConf)
 
@@ -806,7 +946,8 @@ object StateStore extends Logging {
           storeProviderId,
           StateStoreProvider.createAndInit(
             storeProviderId, keySchema, valueSchema, keyStateEncoderSpec,
-            useColumnFamilies, storeConf, hadoopConf, useMultipleValuesPerKey)
+            useColumnFamilies, storeConf, hadoopConf, useMultipleValuesPerKey,
+            stateSchemaBroadcast)
         )
       }
 
@@ -872,13 +1013,15 @@ object StateStore extends Logging {
   /** Start the periodic maintenance task if not already started and if Spark active */
   private def startMaintenanceIfNeeded(storeConf: StateStoreConf): Unit = {
     val numMaintenanceThreads = storeConf.numStateStoreMaintenanceThreads
+    val maintenanceShutdownTimeout = storeConf.stateStoreMaintenanceShutdownTimeout
     loadedProviders.synchronized {
       if (SparkEnv.get != null && !isMaintenanceRunning) {
         maintenanceTask = new MaintenanceTask(
           storeConf.maintenanceInterval,
           task = { doMaintenance() }
         )
-        maintenanceThreadPool = new MaintenanceThreadPool(numMaintenanceThreads)
+        maintenanceThreadPool = new MaintenanceThreadPool(numMaintenanceThreads,
+          maintenanceShutdownTimeout)
         logInfo("State Store maintenance task started")
       }
     }
@@ -936,7 +1079,8 @@ object StateStore extends Logging {
           } finally {
             val duration = System.currentTimeMillis() - startTime
             val logMsg =
-              log"Finished maintenance task for provider=${MDC(LogKeys.STATE_STORE_PROVIDER, id)}" +
+              log"Finished maintenance task for " +
+                log"provider=${MDC(LogKeys.STATE_STORE_PROVIDER_ID, id)}" +
                 log" in elapsed_time=${MDC(LogKeys.TIME_UNITS, duration)}\n"
             if (duration > 5000) {
               logInfo(logMsg)
@@ -966,9 +1110,9 @@ object StateStore extends Logging {
         .map(_.reportActiveInstance(storeProviderId, host, executorId, otherProviderIds))
         .getOrElse(Seq.empty[StateStoreProviderId])
       logInfo(log"Reported that the loaded instance " +
-        log"${MDC(LogKeys.STATE_STORE_PROVIDER, storeProviderId)} is active")
+        log"${MDC(LogKeys.STATE_STORE_PROVIDER_ID, storeProviderId)} is active")
       logDebug(log"The loaded instances are going to unload: " +
-        log"${MDC(LogKeys.STATE_STORE_PROVIDER, providerIdsToUnload.mkString(", "))}")
+        log"${MDC(LogKeys.STATE_STORE_PROVIDER_IDS, providerIdsToUnload)}")
       providerIdsToUnload
     } else {
       Seq.empty[StateStoreProviderId]
@@ -1000,7 +1144,7 @@ object StateStore extends Logging {
         _coordRef = StateStoreCoordinatorRef.forExecutor(env)
       }
       logInfo(log"Retrieved reference to StateStoreCoordinator: " +
-        log"${MDC(LogKeys.STATE_STORE_PROVIDER, _coordRef)}")
+        log"${MDC(LogKeys.STATE_STORE_COORDINATOR, _coordRef)}")
       Some(_coordRef)
     } else {
       _coordRef = null

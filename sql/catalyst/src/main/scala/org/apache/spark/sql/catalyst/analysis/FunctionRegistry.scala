@@ -506,6 +506,8 @@ object FunctionRegistry {
     expression[CollectList]("collect_list"),
     expression[CollectList]("array_agg", true, Some("3.3.0")),
     expression[CollectSet]("collect_set"),
+    expression[ListAgg]("listagg"),
+    expression[ListAgg]("string_agg", setAlias = true),
     expressionBuilder("count_min_sketch", CountMinSketchAggExpressionBuilder),
     expression[BoolAnd]("every", true),
     expression[BoolAnd]("bool_and"),
@@ -611,6 +613,7 @@ object FunctionRegistry {
     expression[MakeValidUTF8]("make_valid_utf8"),
     expression[ValidateUTF8]("validate_utf8"),
     expression[TryValidateUTF8]("try_validate_utf8"),
+    expression[Quote]("quote"),
 
     // url functions
     expression[UrlEncode]("url_encode"),
@@ -882,6 +885,7 @@ object FunctionRegistry {
     // Avro
     expression[FromAvro]("from_avro"),
     expression[ToAvro]("to_avro"),
+    expression[SchemaOfAvro]("schema_of_avro"),
 
     // Protobuf
     expression[FromProtobuf]("from_protobuf"),
@@ -902,7 +906,7 @@ object FunctionRegistry {
   /** Registry for internal functions used by Connect and the Column API. */
   private[sql] val internal: SimpleFunctionRegistry = new SimpleFunctionRegistry
 
-  private def registerInternalExpression[T <: Expression : ClassTag](
+  private[spark] def registerInternalExpression[T <: Expression : ClassTag](
       name: String,
       setAlias: Boolean = false): Unit = {
     val (info, builder) = FunctionRegistryBase.build[T](name, None)

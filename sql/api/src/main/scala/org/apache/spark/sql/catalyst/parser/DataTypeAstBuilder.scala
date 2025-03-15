@@ -30,7 +30,7 @@ import org.apache.spark.sql.catalyst.util.SparkParserUtils.{string, withOrigin}
 import org.apache.spark.sql.connector.catalog.IdentityColumnSpec
 import org.apache.spark.sql.errors.QueryParsingErrors
 import org.apache.spark.sql.internal.SqlApiConf
-import org.apache.spark.sql.types.{ArrayType, BinaryType, BooleanType, ByteType, CalendarIntervalType, CharType, DataType, DateType, DayTimeIntervalType, DecimalType, DoubleType, FloatType, IntegerType, LongType, MapType, MetadataBuilder, NullType, ShortType, StringType, StructField, StructType, TimestampNTZType, TimestampType, VarcharType, VariantType, YearMonthIntervalType}
+import org.apache.spark.sql.types.{ArrayType, BinaryType, BooleanType, ByteType, CalendarIntervalType, CharType, DataType, DateType, DayTimeIntervalType, DecimalType, DoubleType, FloatType, IntegerType, LongType, MapType, MetadataBuilder, NullType, ShortType, StringType, StructField, StructType, TimestampNTZType, TimestampType, TimeType, VarcharType, VariantType, YearMonthIntervalType}
 
 class DataTypeAstBuilder extends SqlBaseParserBaseVisitor[AnyRef] {
   protected def typedVisit[T](ctx: ParseTree): T = {
@@ -58,6 +58,14 @@ class DataTypeAstBuilder extends SqlBaseParserBaseVisitor[AnyRef] {
   }
 
   /**
+   * Create a multi-part identifier.
+   */
+  override def visitMultipartIdentifier(ctx: MultipartIdentifierContext): Seq[String] =
+    withOrigin(ctx) {
+      ctx.parts.asScala.map(_.getText).toSeq
+    }
+
+  /**
    * Resolve/create a primitive type.
    */
   override def visitPrimitiveDataType(ctx: PrimitiveDataTypeContext): DataType = withOrigin(ctx) {
@@ -71,15 +79,18 @@ class DataTypeAstBuilder extends SqlBaseParserBaseVisitor[AnyRef] {
       case (FLOAT | REAL, Nil) => FloatType
       case (DOUBLE, Nil) => DoubleType
       case (DATE, Nil) => DateType
+      case (TIME, Nil) => TimeType(TimeType.MICROS_PRECISION)
+      case (TIME, precision :: Nil) => TimeType(precision.getText.toInt)
       case (TIMESTAMP, Nil) => SqlApiConf.get.timestampType
       case (TIMESTAMP_NTZ, Nil) => TimestampNTZType
       case (TIMESTAMP_LTZ, Nil) => TimestampType
       case (STRING, Nil) =>
         typeCtx.children.asScala.toSeq match {
-          case Seq(_) => SqlApiConf.get.defaultStringType
+          case Seq(_) => StringType
           case Seq(_, ctx: CollateClauseContext) =>
-            val collationName = visitCollateClause(ctx)
-            val collationId = CollationFactory.collationNameToId(collationName)
+            val collationNameParts = visitCollateClause(ctx).toArray
+            val collationId = CollationFactory.collationNameToId(
+              CollationFactory.resolveFullyQualifiedName(collationNameParts))
             StringType(collationId)
         }
       case (CHARACTER | CHAR, length :: Nil) => CharType(length.getText.toInt)
@@ -219,8 +230,8 @@ class DataTypeAstBuilder extends SqlBaseParserBaseVisitor[AnyRef] {
   /**
    * Returns a collation name.
    */
-  override def visitCollateClause(ctx: CollateClauseContext): String = withOrigin(ctx) {
-    ctx.identifier.getText
+  override def visitCollateClause(ctx: CollateClauseContext): Seq[String] = withOrigin(ctx) {
+    visitMultipartIdentifier(ctx.collationName)
   }
 
   /**
